@@ -1,0 +1,130 @@
+/*
+ * Copyright 2011-2026 GatlingCorp (https://gatling.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.gatling.core.feeder
+
+import java.nio.channels.{ FileChannel, ReadableByteChannel }
+import java.util.concurrent.ConcurrentHashMap
+
+import scala.jdk.CollectionConverters._
+import scala.util.Using
+
+import io.gatling.core.config.GatlingConfiguration
+import io.gatling.core.json.{ Json, JsonParsers }
+import io.gatling.core.util._
+
+import com.typesafe.scalalogging.LazyLogging
+
+private[gatling] sealed trait FeederSource[T] {
+  def feeder(options: FeederOptions[T], configuration: GatlingConfiguration): Feeder[Any]
+
+  def name: String
+
+  def recordsCount(options: FeederOptions[T], configuration: GatlingConfiguration): Int
+}
+
+private[gatling] final case class InMemoryFeederSource[T](records: IndexedSeq[Record[T]], override val name: String) extends FeederSource[T] with LazyLogging {
+  require(records.nonEmpty, "Feeder must not be empty")
+
+  override def feeder(options: FeederOptions[T], configuration: GatlingConfiguration): Feeder[Any] =
+    InMemoryFeeder(records, options.conversion, options.strategy)
+
+  override def recordsCount(options: FeederOptions[T], configuration: GatlingConfiguration): Int =
+    records.length
+}
+
+private[feeder] object ZippedResourceCache {
+  private val cache = new ConcurrentHashMap[Resource, Resource]()
+
+  def unzipped(rawResource: Resource, unzip: Boolean): Resource =
+    if (unzip) cache.computeIfAbsent(rawResource, Unzip.unzip) else rawResource
+}
+
+private[gatling] final class JsonFileFeederSource(resource: Resource, jsonParsers: JsonParsers) extends FeederSource[Any] {
+
+  override def feeder(options: FeederOptions[Any], configuration: GatlingConfiguration): Feeder[Any] =
+    Using.resource(ZippedResourceCache.unzipped(resource, options.unzip).inputStream) { is =>
+      val node = jsonParsers.parse(is)
+      require(node.isArray, "JSON feeder files root node must be an array")
+
+      val records = node.elements.asScala.collect {
+        case node if node.isObject => Json.asScala(node).asInstanceOf[collection.immutable.Map[String, Any]]
+      }.toVector
+      InMemoryFeeder(records, options.conversion, options.strategy)
+    }
+
+  override def name: String = s"json(${resource.name})"
+
+  override def recordsCount(options: FeederOptions[Any], configuration: GatlingConfiguration): Int =
+    Using.resource(ZippedResourceCache.unzipped(resource, options.unzip).inputStream) { is =>
+      Json.arrayOfObjectsLength(is, jsonParsers)
+    }
+}
+
+private[gatling] sealed abstract class FileLinesFeederSource[T](shortName: String, resource: Resource) extends FeederSource[T] {
+  protected def hasHeaderLine(options: FeederOptions[T]): Boolean
+
+  protected def feederFactory(options: FeederOptions[T], configuration: GatlingConfiguration): ReadableByteChannel => Feeder[T]
+
+  override def feeder(options: FeederOptions[T], configuration: GatlingConfiguration): Feeder[Any] = {
+    val factory = feederFactory(options, configuration)
+
+    def applyBatch(res: Resource): Feeder[Any] =
+      if (res.file.length > configuration.core.feederAdaptiveLoadModeThreshold) {
+        BatchedFeeder(res.file, factory, options.conversion, options.strategy)
+      } else {
+        val records = Using.resource(FileChannel.open(res.file.toPath)) { channel =>
+          factory(channel).toVector
+        }
+        InMemoryFeeder(records, options.conversion, options.strategy)
+      }
+
+    val uncompressedResource = ZippedResourceCache.unzipped(resource, options.unzip)
+    applyBatch(uncompressedResource)
+  }
+
+  override def name: String = s"$shortName(${resource.name})"
+
+  override def recordsCount(options: FeederOptions[T], configuration: GatlingConfiguration): Int = {
+    val uncompressedResource = ZippedResourceCache.unzipped(resource, options.unzip)
+    val linesIncludingHeader = Using.resource(uncompressedResource.inputStream)(LineCounter(configuration.core.charset).countLines)
+    val headerLineOffset = if (hasHeaderLine(options)) 1 else 0
+
+    linesIncludingHeader - headerLineOffset
+  }
+}
+
+private[gatling] final class SeparatedValuesFeederSource(resource: Resource, separator: Char, quoteChar: Char)
+    extends FileLinesFeederSource[String]("csv", resource) {
+  // when the user provides the headers, the file doesn't have a header line and its first line is a record
+  override protected def hasHeaderLine(options: FeederOptions[String]): Boolean = options.headers.isEmpty
+
+  override protected def feederFactory(
+      options: FeederOptions[String],
+      configuration: GatlingConfiguration
+  ): ReadableByteChannel => Feeder[String] =
+    options.headers match {
+      case Some(headers) => SeparatedValuesParser.headerlessFeederFactory(separator, quoteChar, configuration.core.charset, headers)
+      case _             => SeparatedValuesParser.feederFactory(separator, quoteChar, configuration.core.charset)
+    }
+}
+
+private[gatling] final class JsonlFeederSource(resource: Resource, jsonParsers: JsonParsers) extends FileLinesFeederSource[Any]("jsonl", resource) {
+  override protected def hasHeaderLine(options: FeederOptions[Any]): Boolean = false
+
+  override protected def feederFactory(options: FeederOptions[Any], configuration: GatlingConfiguration): ReadableByteChannel => Feeder[Any] =
+    JsonlParser.feederFactory(jsonParsers)
+}

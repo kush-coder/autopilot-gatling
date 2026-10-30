@@ -1,0 +1,51 @@
+/*
+ * Copyright 2011-2026 GatlingCorp (https://gatling.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.gatling.http.client.body.multipart.impl;
+
+import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+import io.gatling.http.client.body.multipart.FileLikePart;
+
+public abstract class FileLikePartImpl<T extends FileLikePart<?>> extends PartImpl {
+
+  /** Attachment's file name as a byte array */
+  private static final byte[] FILE_NAME_BYTES = "; filename=".getBytes(US_ASCII);
+
+  // File name encoded to bytes once and reused by both the length-counting and the byte-writing
+  // visit passes, instead of being re-encoded on each pass. null when the part has no file name.
+  private final byte[] fileNameBytes;
+
+  FileLikePartImpl(T part, byte[] boundary) {
+    super(part, boundary);
+    String fileName = part.getFileName();
+    this.fileNameBytes =
+        fileName != null
+            ? fileName.getBytes(part.getCharset() != null ? part.getCharset() : UTF_8)
+            : null;
+  }
+
+  protected void visitContentDispositionHeader(PartVisitor visitor) {
+    super.visitContentDispositionHeader(visitor);
+    if (fileNameBytes != null) {
+      visitor.withBytes(FILE_NAME_BYTES);
+      visitor.withByte(QUOTE_BYTE);
+      visitor.withBytes(fileNameBytes);
+      visitor.withByte(QUOTE_BYTE);
+    }
+  }
+}

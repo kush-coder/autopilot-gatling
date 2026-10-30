@@ -1,0 +1,351 @@
+/*
+ * Copyright 2011-2026 GatlingCorp (https://gatling.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.gatling.javaapi.core;
+
+import io.gatling.core.feeder.FileBasedFeederBuilder;
+import io.gatling.core.feeder.SeparatedValuesParser;
+import io.gatling.javaapi.core.internal.Converters;
+import java.util.List;
+import java.util.Map;
+import java.util.function.BiFunction;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import org.jspecify.annotations.NonNull;
+
+/**
+ * Builder of feeders, ie sources of data that are shared amongst all virtual users. Typically
+ * backed by an underlying resource, such as a CSV file.
+ *
+ * <p>Immutable so each method doesn't mutate the current instance but returns a new one.
+ *
+ * @param <T> the type of values the feeder will provide
+ */
+public interface FeederBuilder<T> {
+
+  /**
+   * Set a queue strategy. Records will be provided in the same order as defined in the underlying
+   * source. A given record will only be provided once. The run will be immediately stopped if the
+   * feeder runs out of records.
+   *
+   * @return a new FeederBuilder
+   */
+  @NonNull FeederBuilder<T> queue();
+
+  /**
+   * Set a random strategy. Records will be provided in a random order, unrelated to the order in
+   * the underlying source. A given record can be provided multiple times. Such feeder will never
+   * run out of records.
+   *
+   * @return a new FeederBuilder
+   */
+  @NonNull FeederBuilder<T> random();
+
+  /**
+   * Set a shuffle strategy. Records will be provided in a random order, unrelated to the order in
+   * the underlying source. A given record will only be provided once. The run will be immediately
+   * stopped if the feeder runs out of records.
+   *
+   * @return a new FeederBuilder
+   */
+  @NonNull FeederBuilder<T> shuffle();
+
+  /**
+   * Set a circular strategy. Records will be provided in the same order as defined in the
+   * underlying source. Once the last record of the underlying source is reached, the feeder will go
+   * back to the first record. A given record can be provided multiple times. Such feeder will never
+   * run out of records.
+   *
+   * @return a new FeederBuilder
+   */
+  @NonNull FeederBuilder<T> circular();
+
+  /**
+   * Provide a function to transform records as defined in the underlying source
+   *
+   * @param f the transformation function
+   * @return a new FeederBuilder
+   */
+  @NonNull FeederBuilder<Object> transform(@NonNull BiFunction<String, T, Object> f);
+
+  /**
+   * Read all the records of the underlying source.
+   *
+   * @return the whole data
+   */
+  @NonNull List<Map<String, Object>> readRecords();
+
+  /**
+   * Return the number of records more efficiantly than readRecords().size().
+   *
+   * @return the number of recordss
+   */
+  int recordsCount();
+
+  /**
+   * Distribute data evenly amongst all the injectors of a Gatling Enterprise cluster. Only
+   * effective when the test is running with Gatling Enterprise, noop otherwise.
+   *
+   * @return a new FeederBuilder
+   */
+  @NonNull FeederBuilder<T> shard();
+
+  /**
+   * For internal use only
+   *
+   * @return the wrapped Scala instance
+   */
+  scala.Function0<scala.collection.Iterator<scala.collection.immutable.Map<String, Object>>>
+      asScala();
+
+  /**
+   * A {@link FeederBuilder} that is backed by a file.
+   *
+   * @param <T> the type of values the feeder will provide
+   */
+  interface FileBased<T> extends FeederBuilder<T> {
+    @Override
+    @NonNull FileBased<T> queue();
+
+    @Override
+    @NonNull FileBased<T> random();
+
+    @Override
+    @NonNull FileBased<T> shuffle();
+
+    @Override
+    @NonNull FileBased<T> circular();
+
+    @Override
+    @NonNull FileBased<T> shard();
+
+    /**
+     * Advice to unzip the underlying source because it's a zip or tar file
+     *
+     * @return a new FileBased
+     */
+    @NonNull FileBased<T> unzip();
+  }
+
+  /**
+   * A {@link FeederBuilder} that is backed by a separated-values file, such as a CSV one.
+   *
+   * @param <T> the type of values the feeder will provide
+   */
+  interface SeparatedValues<T> extends FileBased<T> {
+    @Override
+    @NonNull SeparatedValues<T> queue();
+
+    @Override
+    @NonNull SeparatedValues<T> random();
+
+    @Override
+    @NonNull SeparatedValues<T> shuffle();
+
+    @Override
+    @NonNull SeparatedValues<T> circular();
+
+    @Override
+    @NonNull SeparatedValues<T> shard();
+
+    @Override
+    @NonNull SeparatedValues<T> unzip();
+
+    /**
+     * Provide the column names of a file that doesn't have a header line. The first line of the
+     * file is then a record like all the other ones.
+     *
+     * @param firstHeader the first column name
+     * @param otherHeaders the other column names
+     * @return a new SeparatedValues
+     */
+    @NonNull SeparatedValues<T> headers(
+        @NonNull String firstHeader, @NonNull String... otherHeaders);
+  }
+
+  final class Impl<T> implements SeparatedValues<T> {
+    private final io.gatling.core.feeder.FileBasedFeederBuilder<T> wrapped;
+
+    @NonNull
+    static SeparatedValues<String> csv(@NonNull String filePath) {
+      return csv(filePath, SeparatedValuesParser.DefaultQuoteChar());
+    }
+
+    @NonNull
+    static SeparatedValues<String> csv(@NonNull String filePath, char quoteChar) {
+      return new Impl<>(
+          io.gatling.core.Predef.csv(filePath, quoteChar, io.gatling.core.Predef.configuration()));
+    }
+
+    @NonNull
+    static SeparatedValues<String> ssv(@NonNull String filePath) {
+      return ssv(filePath, SeparatedValuesParser.DefaultQuoteChar());
+    }
+
+    @NonNull
+    static SeparatedValues<String> ssv(@NonNull String filePath, char quoteChar) {
+      return new Impl<>(
+          io.gatling.core.Predef.ssv(filePath, quoteChar, io.gatling.core.Predef.configuration()));
+    }
+
+    @NonNull
+    static SeparatedValues<String> tsv(@NonNull String filePath) {
+      return tsv(filePath, SeparatedValuesParser.DefaultQuoteChar());
+    }
+
+    @NonNull
+    static SeparatedValues<String> tsv(@NonNull String filePath, char quoteChar) {
+      return new Impl<>(
+          io.gatling.core.Predef.tsv(filePath, quoteChar, io.gatling.core.Predef.configuration()));
+    }
+
+    @NonNull
+    static SeparatedValues<String> separatedValues(@NonNull String filePath, char separator) {
+      return separatedValues(filePath, separator, SeparatedValuesParser.DefaultQuoteChar());
+    }
+
+    @NonNull
+    static SeparatedValues<String> separatedValues(
+        @NonNull String filePath, char separator, char quoteChar) {
+      return new Impl<>(
+          io.gatling.core.Predef.separatedValues(
+              filePath, separator, quoteChar, io.gatling.core.Predef.configuration()));
+    }
+
+    @NonNull
+    static FileBased<Object> jsonFile(@NonNull String filePath) {
+      return new Impl<>(
+          io.gatling.core.Predef.jsonFile(
+              filePath,
+              io.gatling.core.Predef.defaultJsonParsers(),
+              io.gatling.core.Predef.configuration()));
+    }
+
+    @NonNull
+    static FileBased<Object> jsonlFile(@NonNull String filePath) {
+      return new Impl<>(
+          io.gatling.core.Predef.jsonlFile(
+              filePath,
+              io.gatling.core.Predef.defaultJsonParsers(),
+              io.gatling.core.Predef.configuration()));
+    }
+
+    @NonNull
+    static FeederBuilder<Object> jsonUrl(@NonNull String url) {
+      return new Impl<>(
+          io.gatling.core.Predef.jsonUrl(
+              url,
+              io.gatling.core.Predef.defaultJsonParsers(),
+              io.gatling.core.Predef.configuration()));
+    }
+
+    public Impl(io.gatling.core.feeder.@NonNull FeederBuilderBase<T> wrapped) {
+      this.wrapped = (io.gatling.core.feeder.FileBasedFeederBuilder<T>) wrapped;
+    }
+
+    private Impl<T> make(
+        Function<
+                io.gatling.core.feeder.FileBasedFeederBuilder<T>,
+                io.gatling.core.feeder.FeederBuilderBase<T>>
+            f) {
+      return new Impl<>(f.apply(wrapped));
+    }
+
+    @Override
+    @NonNull
+    public SeparatedValues<T> queue() {
+      return make(FileBasedFeederBuilder::queue);
+    }
+
+    @Override
+    @NonNull
+    public SeparatedValues<T> random() {
+      return make(FileBasedFeederBuilder::random);
+    }
+
+    @Override
+    @NonNull
+    public SeparatedValues<T> shuffle() {
+      return make(FileBasedFeederBuilder::shuffle);
+    }
+
+    @Override
+    @NonNull
+    public SeparatedValues<T> circular() {
+      return make(FileBasedFeederBuilder::circular);
+    }
+
+    @Override
+    @NonNull
+    public FeederBuilder<Object> transform(@NonNull BiFunction<String, T, Object> f) {
+      return new Impl<>(
+          wrapped.transform(
+              new scala.PartialFunction<scala.Tuple2<String, T>, Object>() {
+
+                @Override
+                public boolean isDefinedAt(scala.Tuple2<String, T> x) {
+                  return true;
+                }
+
+                @Override
+                public Object apply(scala.Tuple2<String, T> v1) {
+                  return f.apply(v1._1, v1._2);
+                }
+              }));
+    }
+
+    @Override
+    @NonNull
+    public List<Map<String, Object>> readRecords() {
+      return Converters.toJavaList(wrapped.readRecords()).stream()
+          .map(Converters::toJavaMap)
+          .collect(Collectors.toList());
+    }
+
+    @Override
+    public int recordsCount() {
+      return wrapped.recordsCount();
+    }
+
+    @Override
+    @NonNull
+    public SeparatedValues<T> shard() {
+      return make(FileBasedFeederBuilder::shard);
+    }
+
+    @Override
+    @NonNull
+    public SeparatedValues<T> unzip() {
+      return make(FileBasedFeederBuilder::unzip);
+    }
+
+    @Override
+    @NonNull
+    public SeparatedValues<T> headers(
+        @NonNull String firstHeader, @NonNull String... otherHeaders) {
+      return new Impl<>(
+          ((io.gatling.core.feeder.SeparatedValuesFeederBuilder<T>) wrapped)
+              .headers(firstHeader, Converters.toScalaSeq(otherHeaders)));
+    }
+
+    @Override
+    public scala.Function0<
+            scala.collection.Iterator<scala.collection.immutable.Map<String, Object>>>
+        asScala() {
+      return wrapped;
+    }
+  }
+}

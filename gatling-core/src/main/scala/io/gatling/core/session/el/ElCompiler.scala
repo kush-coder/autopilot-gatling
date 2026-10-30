@@ -1,0 +1,623 @@
+/*
+ * Copyright 2011-2026 GatlingCorp (https://gatling.io)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.gatling.core.session.el
+
+import java.{ lang => jl, util => ju }
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.util.UUID
+import java.util.concurrent.ThreadLocalRandom
+
+import scala.annotation.tailrec
+import scala.reflect.ClassTag
+import scala.util.control.NonFatal
+import scala.util.parsing.combinator.RegexParsers
+
+import io.gatling.commons.NotNothing
+import io.gatling.commons.util.{ TypeCaster, TypeHelper }
+import io.gatling.commons.util.StringHelper._
+import io.gatling.commons.validation._
+import io.gatling.core.json.Json
+import io.gatling.core.session._
+import io.gatling.core.util.Html
+import io.gatling.shared.util.StringBuilderPool
+
+import com.typesafe.scalalogging.StrictLogging
+import io.github.metarank.cfor._
+
+object ElMessages {
+  def undefinedSeqIndex(name: String, index: Int): Failure = s"Seq named '$name' is undefined for index $index".failure
+  def undefinedSessionAttribute(name: String): Failure = s"No attribute named '$name' is defined".failure
+  def undefinedMapKey(map: String, key: String): Failure = s"Map named '$map' does not contain key '$key'".failure
+  def sizeNotSupported(value: Any, name: String): Failure = s"$value named '$name' does not support .size function".failure
+  def accessByKeyNotSupported(value: Any, name: String): Failure = s"$value named '$name' does not support access by key".failure
+  def randomNotSupported(value: Any, name: String): Failure = s"$value named '$name' does not support .random function".failure
+  def indexAccessNotSupported(value: Any, name: String): Failure = s"$value named '$name' does not support index access".failure
+  def outOfRangeAccess(name: String, value: Any, index: Int): Failure = s"Product $value named $name has no element with index $index".failure
+  def tupleAccessNotSupported(name: String, value: Any): Failure = s"$value named $name do not support tuple access".failure
+  def htmlUnescapeNotSupported(value: Any, name: String): Failure = s"$value named '$name' does not support .htmlUnescape function".failure
+}
+
+sealed trait ElPart[+T] extends (Session => Validation[T]) with Product with Serializable
+
+final case class StaticPart(string: String) extends ElPart[String] {
+  def apply(session: Session): Validation[String] = string.success
+}
+
+final case class AttributePart(name: String) extends ElPart[Any] {
+  def apply(session: Session): Validation[Any] = session(name).validate[Any]
+}
+
+final case class SizePart(seqPart: ElPart[Any], name: String) extends ElPart[Int] {
+  def apply(session: Session): Validation[Int] =
+    seqPart(session).flatMap {
+      case t: Iterable[_]               => t.size.success
+      case collection: ju.Collection[_] => collection.size.success
+      case map: ju.Map[_, _]            => map.size.success
+      case arr: Array[_]                => arr.length.success
+      case product: Product             => product.productArity.success
+      case other                        => ElMessages.sizeNotSupported(other, name)
+    }
+}
+
+final case class RandomPart(seq: ElPart[Any], name: String) extends ElPart[Any] {
+  @SuppressWarnings(Array("org.wartremover.warts.SeqApply"))
+  def apply(session: Session): Validation[Any] = {
+    def random(size: Int) = ThreadLocalRandom.current.nextInt(size)
+
+    seq(session).flatMap {
+      case seq: Seq[_]      => seq(random(seq.size)).success
+      case list: ju.List[_] => list.get(random(list.size)).success
+      case arr: Array[_]    => arr(random(arr.length)).success
+      case product: Product => product.productElement(random(product.productArity)).success
+      case other            => ElMessages.randomNotSupported(other, name)
+    }
+  }
+}
+
+final case class ExistsPart(part: ElPart[Any], name: String) extends ElPart[Boolean] {
+  def apply(session: Session): Validation[Boolean] =
+    part(session) match {
+      case _: Failure => Validation.FalseSuccess
+      case _          => Validation.TrueSuccess
+    }
+}
+
+final case class IsUndefinedPart(part: ElPart[Any], name: String) extends ElPart[Boolean] {
+  def apply(session: Session): Validation[Boolean] =
+    part(session) match {
+      case _: Failure => Validation.TrueSuccess
+      case _          => Validation.FalseSuccess
+    }
+}
+
+final case class JsonStringify(part: ElPart[Any], name: String) extends ElPart[String] {
+  def apply(session: Session): Validation[String] =
+    part(session) match {
+      case Success(value)   => Json.stringify(value, isRootObject = false).success
+      case failure: Failure => if (TypeHelper.isNullValueFailure(failure)) Validation.NullStringSuccess else failure
+    }
+}
+
+final case class HtmlUnescape(part: ElPart[Any], name: String) extends ElPart[String] {
+  def apply(session: Session): Validation[String] =
+    part(session).flatMap {
+      case s: String => Success(Html.unescape(s))
+      case other     => ElMessages.htmlUnescapeNotSupported(other, name)
+    }
+}
+
+private class IntStringOpt(val s: String) extends AnyVal {
+  def isEmpty: Boolean =
+    s.toCharArray.zipWithIndex.exists { case (char, i) =>
+      (char < '0' || char > '9') && !(char == '-' && i == 0)
+    }
+
+  def get: Int = s.toInt
+}
+
+private object IntString {
+  def unapply(s: String): IntStringOpt = new IntStringOpt(s)
+}
+
+final case class SeqElementPart(seq: ElPart[Any], seqName: String, index: String) extends ElPart[Any] {
+  // `index` is a constant known at EL-compile time: resolve once whether it's a static integer
+  // literal or the name of a session attribute holding the index, rather than re-parsing the
+  // string on every evaluation.
+  private val staticIndex: Option[Int] = index match {
+    case IntString(i) => Some(i)
+    case _            => None
+  }
+
+  def apply(session: Session): Validation[Any] = {
+    @SuppressWarnings(Array("org.wartremover.warts.SeqApply"))
+    def seqElementPart(index: Int): Validation[Any] = seq(session).flatMap {
+      case seq: collection.Seq[_] =>
+        val actualIndex = if (index >= 0) index else seq.length + index
+        if (seq.isDefinedAt(actualIndex)) {
+          seq(actualIndex).success
+        } else {
+          ElMessages.undefinedSeqIndex(seqName, index)
+        }
+
+      case arr: Array[_] =>
+        val actualIndex = if (index >= 0) index else arr.length + index
+        if (actualIndex >= 0 && actualIndex < arr.length) {
+          arr(actualIndex).success
+        } else {
+          ElMessages.undefinedSeqIndex(seqName, index)
+        }
+
+      case list: ju.List[_] =>
+        val actualIndex = if (index >= 0) index else list.size + index
+        if (actualIndex >= 0 && actualIndex < list.size) {
+          list.get(actualIndex).success
+        } else {
+          ElMessages.undefinedSeqIndex(seqName, index)
+        }
+
+      case product: Product =>
+        val actualIndex = if (index >= 0) index else product.productArity + index
+        if (actualIndex >= 0 && actualIndex < product.productArity) {
+          product.productElement(actualIndex).success
+        } else {
+          ElMessages.outOfRangeAccess(seqName, product, index)
+        }
+
+      case other => ElMessages.indexAccessNotSupported(other, seqName)
+    }
+
+    staticIndex match {
+      case Some(i) => seqElementPart(i)
+      case _       => session(index).validate[Int].flatMap(seqElementPart)
+    }
+  }
+}
+
+final case class MapKeyPart(map: ElPart[Any], mapName: String, key: String) extends ElPart[Any] {
+  @SuppressWarnings(Array("org.wartremover.warts.Return"))
+  private def lookup(product: Product): Validation[Any] = {
+    cfor(0 until product.productArity) { i =>
+      if (product.productElementName(i) == key) {
+        return product.productElement(i).success
+      }
+    }
+    ElMessages.undefinedMapKey(mapName, key)
+  }
+
+  def apply(session: Session): Validation[Any] = map(session).flatMap {
+    case m: collection.Map[_, _] =>
+      m.asInstanceOf[collection.Map[Any, _]].get(key) match {
+        case Some(value) => value.success
+        case _           => ElMessages.undefinedMapKey(mapName, key)
+      }
+
+    case map: ju.Map[_, _] =>
+      if (map.containsKey(key)) map.get(key).success
+      else ElMessages.undefinedMapKey(mapName, key)
+
+    case product: Product => lookup(product)
+
+    case other =>
+      Pojos.getProperty(other, key) match {
+        case _: Failure => ElMessages.accessByKeyNotSupported(other, mapName)
+        case success    => success
+      }
+  }
+}
+
+final case class TupleAccessPart(tuple: ElPart[Any], tupleName: String, index: Int) extends ElPart[Any] {
+  def apply(session: Session): Validation[Any] = tuple(session).flatMap {
+    case product: Product =>
+      if (index > 0 && product.productArity >= index) product.productElement(index - 1).success
+      else ElMessages.outOfRangeAccess(tupleName, product, index)
+
+    case other => ElMessages.tupleAccessNotSupported(tupleName, other)
+  }
+}
+
+case object CurrentTimeMillisPart extends ElPart[Long] {
+  def apply(session: Session): Validation[Long] = System.currentTimeMillis().success
+}
+
+final case class CurrentDateTimePart(format: DateTimeFormatter) extends ElPart[String] {
+  def apply(session: Session): Validation[String] = format.format(ZonedDateTime.now()).success
+}
+
+case object RandomSecureUUID extends ElPart[String] {
+  def apply(session: Session): Validation[String] = UUID.randomUUID().toString.success
+}
+
+case object RandomUUID extends ElPart[String] {
+  private val Version4Mask = 4L << 12 // set version nibble to 4 (RFC 4122 §4.1.3)
+  private val VariantMask = 2L << 62
+
+  def apply(session: Session): Validation[String] = {
+    val rnd = ThreadLocalRandom.current()
+    val mostSigBits = (rnd.nextLong() & ~0xf000L) | Version4Mask
+    val leastSigBits = ((rnd.nextLong() << 2) >>> 2) | VariantMask
+    new UUID(mostSigBits, leastSigBits).toString.success
+  }
+}
+
+case object RandomInt extends ElPart[Int] {
+  def apply(session: Session): Validation[Int] = ThreadLocalRandom.current().nextInt().success
+}
+
+final case class RandomIntRange(min: Int, max: Int) extends ElPart[Int] {
+  require(min < max, s"Range 'max'($max) must be above than 'min'($min)")
+  def apply(session: Session): Validation[Int] = ThreadLocalRandom.current().nextInt(min, max).success
+}
+
+case object RandomLong extends ElPart[Long] {
+  def apply(session: Session): Validation[Long] = ThreadLocalRandom.current().nextLong().success
+}
+
+case object UserId extends ElPart[Long] {
+  def apply(session: Session): Validation[Long] = session.userId.success
+}
+
+final case class RandomLongRange(min: Long, max: Long) extends ElPart[Long] {
+  require(min < max, s"Range 'max'($max) must be above than 'min'($min)")
+  def apply(session: Session): Validation[Long] = ThreadLocalRandom.current().nextLong(min, max).success
+}
+
+final case class RandomDoubleRange(min: Double, max: Double) extends ElPart[Double] {
+  require(min < max, s"'max'($max) should be greater than 'min'($min)")
+  def apply(session: Session): Validation[Double] =
+    ThreadLocalRandom.current().nextDouble(min, max).success
+}
+
+final case class RandomDoubleRangeDigits(min: Double, max: Double, fractionalDigits: Int) extends ElPart[Double] {
+  require(min < max, s"'max'($max) should be greater than 'min'($min)")
+  require(fractionalDigits >= 0, s"fractionalDigits($fractionalDigits) must be positive")
+
+  private val tens = Math.pow(10.0, fractionalDigits)
+  def apply(session: Session): Validation[Double] =
+    ((ThreadLocalRandom.current().nextDouble(min, max) * tens).round / tens).success
+}
+
+object RandomAlphanumeric {
+  private val AlphanumericChars: Array[Char] = (('a' to 'z') ++ ('A' to 'Z') ++ ('0' to '9')).toArray
+}
+
+final case class RandomAlphanumeric(length: Int) extends ElPart[String] {
+  require(length > 0, "'length' should be greater than 0")
+
+  def apply(session: Session): Validation[String] = {
+    val sb = new jl.StringBuilder(length)
+    val rng = ThreadLocalRandom.current()
+    cfor(0 until length) { _ =>
+      sb.append(RandomAlphanumeric.AlphanumericChars(rng.nextInt(RandomAlphanumeric.AlphanumericChars.length)))
+    }
+    sb.toString.success
+  }
+}
+
+final case class RandomString(length: Int, charset: String) extends ElPart[String] {
+  require(length > 0, "'length' should be greater than 0")
+  require(charset.nonEmpty, "'charset' should not be empty")
+
+  private val chars: Array[Char] = charset.toCharArray
+
+  def apply(session: Session): Validation[String] = {
+    val sb = new jl.StringBuilder(length)
+    val rng = ThreadLocalRandom.current()
+    cfor(0 until length) { _ =>
+      sb.append(chars(rng.nextInt(chars.length)))
+    }
+    sb.toString.success
+  }
+}
+
+// `randomString` without an explicit charset: draw from the whole UTF-8 charset, restricted to the
+// Basic Multilingual Plane so that every generated char is a full code point and `length` is exactly
+// the length of the generated String. Surrogates and unassigned code points are rejected.
+final case class RandomUtf8String(length: Int) extends ElPart[String] {
+  require(length > 0, "'length' should be greater than 0")
+
+  def apply(session: Session): Validation[String] = {
+    val sb = new jl.StringBuilder(length)
+    val rng = ThreadLocalRandom.current()
+    cfor(0 until length) { _ =>
+      var c = rng.nextInt(Character.MIN_SUPPLEMENTARY_CODE_POINT)
+      while (Character.isSurrogate(c.toChar) || !Character.isDefined(c)) {
+        c = rng.nextInt(Character.MIN_SUPPLEMENTARY_CODE_POINT)
+      }
+      sb.append(c.toChar)
+    }
+    sb.toString.success
+  }
+}
+
+object RandomOneOf {
+  private val BooleanValues = Set("true", "false")
+  private val IntegerRegex = """-?\d+""".r
+  private val DecimalRegex = """-?\d+\.\d+""".r
+
+  // Splits and trims the raw, comma-separated argument list matched by the grammar. Doing this
+  // here (in the semantic action), rather than as a grammar rule, is what makes this parser rule
+  // match unconditionally on any "randomOneOf(...)" call (no backtracking into being parsed as a
+  // session attribute named "randomOneOf" with an index access). Consecutive, leading or trailing
+  // commas simply yield an empty-string value, resolving to the String type unless every other
+  // value happens to also be empty.
+  private[el] def parseValues(rawArgs: String): List[String] = rawArgs.split(",", -1).toList.map(_.trim)
+
+  // Resolved once at EL-compile time: the target type is picked from the whole set of literal
+  // values (not per-value), following, in order: boolean (only "true"/"false") > double (only
+  // numbers, at least one decimal) > long (only numbers, at least one outside the int range) >
+  // int (only numbers) > string (fallback).
+  private def resolve(values: List[String]): Array[Any] =
+    if (values.forall(BooleanValues.contains)) {
+      values.map(_.toBoolean).toArray
+    } else if (values.forall(v => IntegerRegex.matches(v) || DecimalRegex.matches(v))) {
+      if (values.exists(DecimalRegex.matches)) {
+        values.map(_.toDouble).toArray
+      } else {
+        val bigValues = values.map(BigInt(_))
+        if (bigValues.forall(v => v >= BigInt(Long.MinValue) && v <= BigInt(Long.MaxValue))) {
+          if (bigValues.exists(v => v < BigInt(Int.MinValue) || v > BigInt(Int.MaxValue))) {
+            bigValues.map(_.toLong).toArray
+          } else {
+            bigValues.map(_.toInt).toArray
+          }
+        } else {
+          values.toArray
+        }
+      }
+    } else {
+      values.toArray
+    }
+}
+
+final case class RandomOneOf(values: List[String]) extends ElPart[Any] {
+  private val resolvedValues: Array[Any] = RandomOneOf.resolve(values)
+
+  def apply(session: Session): Validation[Any] =
+    resolvedValues(ThreadLocalRandom.current().nextInt(resolvedValues.length)).success
+}
+
+final class ElParserException(string: String, msg: String) extends Exception(s"Failed to parse $string with error '$msg'")
+
+object ElCompiler extends StrictLogging {
+  private val NameRegex = """[^.#{}()]+""".r
+  private val DateFormatRegex = """[^#{}()]+""".r
+  // Greedily runs up to the last ')' before the end of the EL expression, so the charset itself may
+  // contain '(' and ')'. '#', '{' and '}' stay excluded so the match can never escape the enclosing
+  // '#{}'. Possibly empty so that an empty charset is rejected by RandomString's require instead of
+  // a cryptic parser error.
+  private val CharsetRegex = """[^#{}]*\)""".r
+  private val NumberRegex = """\d+""".r
+  private val NumberRegexWithNegative = """-?\d+""".r
+  private val DecimalRegexWithNegative = """-?\d+\.\d+""".r
+  private val RandomOneOfArgsRegex = """[^#{}()]*""".r
+  private val DynamicPartStart = "#{"
+  private val DynamicPartStartChars = DynamicPartStart.toCharArray
+
+  private val ElCompilers: ThreadLocal[ElCompiler] = new ThreadLocal[ElCompiler] {
+    override def initialValue = new ElCompiler
+  }
+
+  @throws[ElParserException]
+  def parse(string: String): List[ElPart[Any]] =
+    ElCompilers.get.parseEl(string)
+
+  def compile[T: TypeCaster: ClassTag: NotNothing](string: String): Expression[T] =
+    parse(string) match {
+      case StaticPart(staticStr) :: Nil =>
+        val runtimeClass = implicitly[ClassTag[T]].runtimeClass
+        if (runtimeClass == classOf[String] || runtimeClass == classOf[Any] || runtimeClass == classOf[Object]) {
+          StaticValueExpression(staticStr).asInstanceOf[Expression[T]]
+        } else {
+          val stringV = TypeHelper.validate[T](staticStr)
+          _ => stringV
+        }
+
+      case dynamicPart :: Nil => dynamicPart(_).flatMap(TypeHelper.validate[T])
+
+      case parts =>
+        (session: Session) =>
+          parts
+            .foldLeft(StringBuilderPool.DEFAULT.get().success) { (sb, part) =>
+              part match {
+                case StaticPart(s) => sb.map(_.append(s))
+                case _             =>
+                  for {
+                    sb <- sb
+                    part <- part(session)
+                  } yield sb.append(part)
+              }
+            }
+            .flatMap(value => TypeHelper.validate[T](value.toString))
+    }
+}
+
+private[el] sealed trait AccessToken extends Product with Serializable { def token: String }
+private[el] final case class AccessIndex(pos: String, token: String) extends AccessToken
+private[el] final case class AccessKey(key: String, token: String) extends AccessToken
+private[el] sealed trait AccessFunction extends AccessToken { protected def functionToken(functionName: String) = s".$functionName()" }
+private[el] case object AccessRandom extends AccessFunction { val token: String = functionToken("random") }
+private[el] case object AccessSize extends AccessFunction { val token: String = functionToken("size") }
+private[el] case object AccessExists extends AccessFunction { val token: String = functionToken("exists") }
+private[el] case object AccessIsUndefined extends AccessFunction { val token: String = functionToken("isUndefined") }
+private[el] case object AccessJsonStringify extends AccessFunction { val token: String = functionToken("jsonStringify") }
+private[el] case object AccessHtmlUnescape extends AccessFunction { val token: String = functionToken("htmlUnescape") }
+private[el] final case class AccessTuple(index: String, token: String) extends AccessToken
+
+final class ElCompiler private extends RegexParsers {
+  import ElCompiler._
+
+  override def skipWhitespace = false
+
+  private def parseEl(string: String): List[ElPart[Any]] = {
+    val parseResult =
+      try {
+        parseAll(parser, string)
+      } catch { case NonFatal(e) => throw new ElParserException(string, e.getMessage) }
+
+    parseResult match {
+      case Success(parts, _) => parts
+      case ns: NoSuccess     => throw new ElParserException(string, ns.msg)
+    }
+  }
+
+  private val parser: Parser[List[ElPart[Any]]] = (elExpr | staticPart).*
+
+  private val staticPartPattern: Parser[List[String]] = new Parser[String] {
+    override def apply(in: Input): ParseResult[String] = {
+      val source = in.source
+      val offset = in.offset
+      val end = source.length
+
+      source.indexOf(DynamicPartStartChars, offset) match {
+        case -1 => Success(source.subSequence(offset, end).toString, in.drop(end - offset))
+        case n  =>
+          var precedingBackslashesCount = 0
+          var pos = n - 1
+          while (pos >= offset && source.charAt(pos) == '\\') {
+            precedingBackslashesCount += 1
+            pos -= 1
+          }
+          val escapedBackslashesCount = precedingBackslashesCount / 2
+          val unescapedBackslashesCount = precedingBackslashesCount % 2
+
+          val precedingCharacters = source.subSequence(offset, n - precedingBackslashesCount).toString + "\\" * escapedBackslashesCount
+
+          if (unescapedBackslashesCount == 0) {
+            // the dynamic header is not escaped
+            Success(precedingCharacters, in.drop(n - offset))
+          } else {
+            // the dynamic header is escaped
+            Success(precedingCharacters + DynamicPartStart, in.drop(n - offset + DynamicPartStart.length))
+          }
+      }
+    }
+  } >> {
+    case "" => success(Nil)
+    case s  => staticPartPattern ^^ (s :: _)
+  }
+
+  private def staticPart: Parser[StaticPart] =
+    staticPartPattern.^?(
+      {
+        case staticStr if staticStr.nonEmpty => StaticPart(staticStr.mkString)
+      },
+      _ => "Not a static part"
+    )
+
+  private def elExpr: Parser[ElPart[Any]] = DynamicPartStart ~> (nonSessionObject | sessionObject | emptyAttribute) <~ "}"
+
+  private def currentTimeMillis: Parser[ElPart[Any]] = "currentTimeMillis()" ^^ (_ => CurrentTimeMillisPart)
+
+  private def currentDate: Parser[ElPart[Any]] =
+    "currentDate(" ~> DateFormatRegex <~ ")" ^^ (format => CurrentDateTimePart(DateTimeFormatter.ofPattern(format)))
+
+  private def randomSecureUuid: Parser[ElPart[Any]] = "randomSecureUuid()" ^^ (_ => RandomSecureUUID)
+
+  private def randomUuid: Parser[ElPart[Any]] = "randomUuid()" ^^ (_ => RandomUUID)
+
+  private def randomInt: Parser[ElPart[Any]] = "randomInt()" ^^ (_ => RandomInt)
+
+  private def randomIntRange: Parser[ElPart[Any]] = "randomInt(" ~> NumberRegexWithNegative ~ ("," ~> NumberRegexWithNegative) <~ ")" ^^ { case min ~ max =>
+    RandomIntRange(min.toInt, max.toInt)
+  }
+
+  private def randomLong: Parser[ElPart[Any]] = "randomLong()" ^^ (_ => RandomLong)
+
+  private def randomLongRange: Parser[ElPart[Any]] = "randomLong(" ~> NumberRegexWithNegative ~ ("," ~> NumberRegexWithNegative) <~ ")" ^^ { case min ~ max =>
+    RandomLongRange(min.toLong, max.toLong)
+  }
+
+  private def randomDoubleRange: Parser[ElPart[Any]] = "randomDouble(" ~> DecimalRegexWithNegative ~ ("," ~> DecimalRegexWithNegative) <~ ")" ^^ {
+    case min ~ max =>
+      RandomDoubleRange(min.toDouble, max.toDouble)
+  }
+
+  private def randomDoubleRangeDigits: Parser[ElPart[Any]] =
+    "randomDouble(" ~> DecimalRegexWithNegative ~ ("," ~> DecimalRegexWithNegative) ~ ("," ~> NumberRegex) <~ ")" ^^ { case min ~ max ~ digit =>
+      RandomDoubleRangeDigits(min.toDouble, max.toDouble, digit.toInt)
+    }
+
+  private def randomAlphanumeric: Parser[ElPart[Any]] =
+    "randomAlphanumeric(" ~> NumberRegex <~ ")" ^^ (length => RandomAlphanumeric(length.toInt))
+
+  private def randomString: Parser[ElPart[Any]] =
+    "randomString(" ~> NumberRegexWithNegative ~ ("," ~> CharsetRegex) ^^ { case length ~ charsetAndClosingParen =>
+      RandomString(length.toInt, charsetAndClosingParen.dropRight(1))
+    }
+
+  private def randomUtf8String: Parser[ElPart[Any]] =
+    "randomString(" ~> NumberRegexWithNegative <~ ")" ^^ (length => RandomUtf8String(length.toInt))
+
+  private def randomOneOf: Parser[ElPart[Any]] =
+    "randomOneOf(" ~> RandomOneOfArgsRegex <~ ")" ^^ (rawArgs => RandomOneOf(RandomOneOf.parseValues(rawArgs)))
+
+  private def userId: Parser[ElPart[Any]] = "userId()" ^^ (_ => UserId)
+
+  private def nonSessionObject: Parser[ElPart[Any]] =
+    currentTimeMillis | currentDate | randomUuid | randomSecureUuid | randomInt | randomIntRange | randomLong | randomLongRange | randomDoubleRange | randomDoubleRangeDigits | randomAlphanumeric | randomString | randomUtf8String | randomOneOf | userId
+
+  private def indexAccess: Parser[AccessToken] = "(" ~> NameRegex <~ ")" ^^ (posStr => AccessIndex(posStr, s"($posStr)"))
+
+  private def keyAccess: Parser[AccessToken] = "." ~> NameRegex ^^ (keyName => AccessKey(keyName, "." + keyName))
+
+  private def tupleAccess: Parser[AccessTuple] = "._" ~> NumberRegex ^^ (indexPart => AccessTuple(indexPart, "._" + indexPart))
+
+  private def emptyAttribute: Parser[ElPart[Any]] = "" ^^ (_ => throw new Exception("attribute name is missing"))
+
+  private def sessionObject: Parser[ElPart[Any]] = {
+    @tailrec
+    def sessionObjectRec(accessTokens: List[AccessToken], currentPart: ElPart[Any], currentPartName: String): ElPart[Any] =
+      accessTokens match {
+        case Nil                  => currentPart
+        case token :: otherTokens =>
+          val newPart =
+            token match {
+              case AccessIndex(pos, _)   => SeqElementPart(currentPart, currentPartName, pos)
+              case AccessKey(key, _)     => MapKeyPart(currentPart, currentPartName, key)
+              case AccessRandom          => RandomPart(currentPart, currentPartName)
+              case AccessSize            => SizePart(currentPart, currentPartName)
+              case AccessExists          => ExistsPart(currentPart, currentPartName)
+              case AccessIsUndefined     => IsUndefinedPart(currentPart, currentPartName)
+              case AccessJsonStringify   => JsonStringify(currentPart, currentPartName)
+              case AccessHtmlUnescape    => HtmlUnescape(currentPart, currentPartName)
+              case AccessTuple(index, _) => TupleAccessPart(currentPart, currentPartName, index.toInt)
+            }
+
+          val newPartName = currentPartName + token.token
+          sessionObjectRec(otherTokens, newPart, newPartName)
+      }
+
+    objectName ~ valueAccess.* ^^ { case objectPart ~ accessTokens => sessionObjectRec(accessTokens, objectPart, objectPart.name) }
+  }
+
+  private def objectName: Parser[AttributePart] = NameRegex ^^ AttributePart
+
+  private def functionAccess(access: AccessFunction): Parser[AccessFunction] = access.token ^^ (_ => access)
+
+  private def valueAccess: Parser[AccessToken] =
+    tupleAccess |
+      indexAccess |
+      functionAccess(AccessRandom) |
+      functionAccess(AccessSize) |
+      functionAccess(AccessExists) |
+      functionAccess(AccessIsUndefined) |
+      functionAccess(AccessJsonStringify) |
+      functionAccess(AccessHtmlUnescape) |
+      keyAccess |
+      (elExpr ^^ (_ => throw new Exception("nested attribute definition is not allowed")))
+}
